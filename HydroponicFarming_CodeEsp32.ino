@@ -77,89 +77,117 @@
 
 //   delay(1000);  // Wait for 1 second before reading again
 // }
-
-
-
 #include <Wire.h>
 #include <BH1750.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <WiFi.h>
+#include <ThingSpeak.h>
 
 // Define GPIO pins for controlling the L298N motor driver
-#define IN1_PIN 23  // Control motor direction 1 (change to GPIO 17)
-#define IN2_PIN 19  // Control motor direction 2 (change to GPIO 19)
-#define LIGHT_THRESHOLD 100  // Lux threshold for turning on the pump
+#define IN1_PIN 23  // Control motor direction 1
+#define IN2_PIN 19  // Control motor direction 2
 #define DS18B20_PIN 4  // Pin for DS18B20 (GPIO4)
+
+// Wi-Fi credentials
+const char* ssid = "AIoT Lab VN";        // Replace with your Wi-Fi SSID
+const char* password = "AIoTLab01082023"; // Replace with your Wi-Fi password
+
+// ThingSpeak channel information
+unsigned long channelID = 2776169; // Replace with your ThingSpeak Channel ID
+const char* writeAPIKey = "I6G8EYDBG55RXMD1";   // Replace with your ThingSpeak Write API Key
 
 BH1750 lightSensor;  // Create an instance of the BH1750 sensor
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature tempSensor(&oneWire);
+
+WiFiClient client;
+
+unsigned long lastPrintTime = 0;  // Variable to track the last print time
+const unsigned long printInterval = 600000;  // Interval to push data to ThingSpeak (10 minutes)
+
+// Variables for tracking the pump cycle states
+unsigned long lastPumpRunTime = 0;  // To track the time the pump has been running
+unsigned long lastPumpRestTime = 0; // To track the time the pump has been resting
+
+const unsigned long runTime = 7 * 60 * 60 * 1000;  // 7 hours in milliseconds
+const unsigned long restTime = 1 * 60 * 60 * 1000; // 1 hour in milliseconds
+
+bool pumpRunning = true; // Variable to track pump state
+
 void setup() {
-  // Start serial communication
   Serial.begin(115200);
-
-  // Initialize I2C communication
-  Wire.begin();
-
-  // Initialize the BH1750 sensor
+  Wire.begin();  // Initialize I2C communication
   if (!lightSensor.begin()) {
     Serial.println("BH1750 not detected!");
     while (1);  // Infinite loop if sensor is not found
   }
   Serial.println("BH1750 initialized.");
-  tempSensor.begin();
+  tempSensor.begin();  // Initialize DS18B20 temperature sensor
   Serial.println("DS18B20 Initialized!");
 
-  // Initialize L298N motor driver pins
   pinMode(IN1_PIN, OUTPUT);
   pinMode(IN2_PIN, OUTPUT);
+  digitalWrite(IN1_PIN, HIGH);  // Motor forward
+  digitalWrite(IN2_PIN, LOW);   // Motor forward
 
-  // Ensure the pump is OFF initially
-  digitalWrite(IN1_PIN, LOW);
-  digitalWrite(IN2_PIN, LOW);
+  Serial.print("Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.print(".");
+  }
+  Serial.println("Connected to Wi-Fi!");
+  ThingSpeak.begin(client);
 }
 
 void loop() {
-  // Read the light level (lux) from the BH1750
+  // Read light and temperature data
   float lux = lightSensor.readLightLevel();
-  // Serial.print("Light Level: ");
-  // Serial.print(lux);
-  // Serial.println(" lux");
   tempSensor.requestTemperatures();
   float temperature = tempSensor.getTempCByIndex(0);  // Get temperature in Celsius
 
-  // // Turn the pump on or off based on the light level
-  // if (lux < LIGHT_THRESHOLD) {
-  //   // Turn on the pump (forward direction)
-  //   Serial.println("Turning on the pump...");
-  //   digitalWrite(IN1_PIN, HIGH);  // Motor forward
-  //   digitalWrite(IN2_PIN, LOW);   // Motor forward
-  // } else {
-  //   // Turn off the pump
-  //   Serial.println("Turning off the pump...");
-  //   digitalWrite(IN1_PIN, LOW);   // Stop motor
-  //   digitalWrite(IN2_PIN, LOW);   // Stop motor
-  // }
-  if(Serial.available()>0) {
-    String command = Serial.readStringUntil('\n');
-    if(command == "ON") {
-      Serial.println("Turning on the pump...");
-      digitalWrite(IN1_PIN, HIGH);  // Motor forward
-      digitalWrite(IN2_PIN, LOW);   // Motor forward
-      Serial.print("Temperature (°C): ");
-      Serial.println(temperature);
-      Serial.print("Light Level (lux): ");
-      Serial.println(lux);
-    } else if (command = "OFF") {
-      Serial.println("Turning off the pump...");
-      digitalWrite(IN1_PIN, LOW);   // Stop motor
-      digitalWrite(IN2_PIN, LOW);   // Stop motor
-      // Serial.println("Relay OFF");
+  if (millis() - lastPrintTime >= printInterval) {
+    lastPrintTime = millis();
+    Serial.print("Temperature (°C): ");
+    Serial.println(temperature);
+    Serial.print("Light Level (lux): ");
+    Serial.println(lux);
+    ThingSpeak.setField(1, temperature);
+    ThingSpeak.setField(2, lux);
+    ThingSpeak.setField(3, pumpRunning);
+    int result = ThingSpeak.writeFields(channelID, writeAPIKey);
+    if(result == 200) {
+      Serial.println("Data successfully sent to ThingSpeak.");
     } else {
-      Serial.println("Undefined command!");
+      Serial.print("Error sending data to ThingSpeak. Response: ");
+      Serial.println(result);
     }
   }
 
-  // Delay before the next reading
-  delay(1000);  // Update every second
+  // Pump control logic
+  if (pumpRunning && millis() - lastPumpRunTime >= runTime) {
+    digitalWrite(IN1_PIN, LOW);  // Motor stopped
+    digitalWrite(IN2_PIN, LOW);  // Motor stopped
+    pumpRunning = false;
+    lastPumpRestTime = millis();
+    Serial.println("Pump is resting.");
+  } else if (!pumpRunning && millis() - lastPumpRestTime >= restTime) {
+    digitalWrite(IN1_PIN, HIGH);  // Motor forward
+    digitalWrite(IN2_PIN, LOW);   // Motor forward
+    pumpRunning = true;
+    lastPumpRunTime = millis();
+    Serial.println("Pump is running.");
+  }
+
+  // Check Wi-Fi status periodically and reconnect if needed
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Disconnected from Wi-Fi, attempting to reconnect...");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(1000);
+      Serial.print(".");
+    }
+    Serial.println("Reconnected to Wi-Fi!");
+  }
 }
